@@ -42,7 +42,7 @@ class Experiment:
     def __init__(self):
         self.set_seed()
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        self.beta = 1.0
+        self.beta =  torch.nn.Parameter(torch.tensor([1.0]), requires_grad=False)
 
         login(token='placeholder')
 
