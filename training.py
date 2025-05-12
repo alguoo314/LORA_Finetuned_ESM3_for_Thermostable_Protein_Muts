@@ -66,9 +66,8 @@ class Experiment:
 
         lora_params_2 = [p for p in self.ref_model.parameters() if p.requires_grad]
         print(f'old trainable parameters: {sum(p.numel() for p in lora_params_2)}')
-        #self.optimizer = torch.optim.AdamW(lora_params, lr=1e-4)
-        #temp change to bigger lr to debug 0 gradient issue
-        self.optimizer = torch.optim.AdamW(lora_params, lr=1)
+        self.optimizer = torch.optim.AdamW(lora_params, lr=1e-4)
+    
 
         self.tokenizer = EsmSequenceTokenizer()
         self.batch_size = 16
