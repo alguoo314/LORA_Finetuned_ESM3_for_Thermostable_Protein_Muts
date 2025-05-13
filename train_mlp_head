@@ -1,0 +1,178 @@
+import os
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import pandas as pd
+import numpy as np
+
+from huggingface_hub import login
+from esm.models.esm3 import ESM3
+from esm.tokenization.sequence_tokenizer import EsmSequenceTokenizer
+from torch.utils.data import Dataset, DataLoader
+
+class DPOTripletDataset(Dataset):
+    def __init__(self, df, embeddings):
+        self.triplet_df = df
+        self.embeddings = embeddings
+    
+    def __len__(self):
+        return len(self.triplet_df)
+    
+    def __getitem__(self, idx):
+        row = self.triplet_df.iloc[idx]
+        return self.embeddings[idx], int(row['position']) - 1, row['positive_example_mutation'], row['negative_example_mutation']
+
+class MutationHead(nn.Module):
+    def __init__(self, embed_dim, hidden_dim=512, dropout=0.3):
+        super().__init__()
+        self.layers = nn.Sequential(
+            nn.Linear(embed_dim, hidden_dim),
+            nn.BatchNorm1d(hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, 256),
+            nn.BatchNorm1d(256),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(256, 20),
+        )
+
+    def forward(self, x):
+        return self.layers(x)
+    
+class DPOLoss(nn.Module):
+    def __init__(self, beta: float = 0.1, label_smoothing: float = 0.1):
+        super().__init__()
+        self.beta = beta
+        self.label_smoothing = label_smoothing
+
+    def forward(self, policy_chosen_logps, policy_rejected_logps, ref_chosen_logps, ref_rejected_logps):
+        pi_logratios = policy_chosen_logps - policy_rejected_logps
+        ref_logratios = ref_chosen_logps - ref_rejected_logps
+        logits = pi_logratios - ref_logratios
+        # apply label smoothing
+        positive_weight = 1.0 - self.label_smoothing
+        negative_weight = self.label_smoothing
+        losses = (
+            -F.logsigmoid(self.beta * logits) * positive_weight 
+            - F.logsigmoid(-self.beta * logits) * negative_weight
+        )
+        return losses.mean()
+
+class Experiment:
+    def __init__(self):
+        self.set_seed()
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.beta = 0.1
+        self.num_epochs = 50
+        self.patience = 10
+
+        login(token='placeholder')
+
+        # load frozen ESM model
+        self.model = ESM3.from_pretrained('esm3_sm_open_v1').eval().to(self.device).float()
+        for param in self.model.parameters():
+            param.requires_grad = False
+
+        self.tokenizer = EsmSequenceTokenizer()
+        self.batch_size = 16
+        self.learning_rate = 1e-4
+        self.weight_decay = 1e-2
+
+        embed_dim = 1536
+        self.head_ref = MutationHead(embed_dim).to(self.device)
+        self.head_train = MutationHead(embed_dim).to(self.device)
+        self.head_ref.load_state_dict(self.head_train.state_dict())
+        for param in self.head_ref.parameters():
+            param.requires_grad = False
+        
+        self.dpo = DPOLoss(self.beta, label_smoothing=0.1)
+        self.optimizer = torch.optim.AdamW(
+            self.head_train.parameters(), lr=self.learning_rate, weight_decay=self.weight_decay
+        )
+        # LR scheduler and early stopping
+        self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            self.optimizer, mode='min', factor=0.5, patience=4, verbose=True
+        )
+
+    def set_seed(self, seed=42):
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+
+    def load_data(self, path):
+        train_df = pd.read_pickle(os.path.join(path, 'train_df.pkl'))
+        val_df   = pd.read_pickle(os.path.join(path, 'val_df.pkl'))
+        test_df  = pd.read_pickle(os.path.join(path, 'test_df.pkl'))
+
+        train_embed = torch.load(os.path.join(path, 'train_esm3_embeddings.pt'))
+        val_embed   = torch.load(os.path.join(path, 'val_esm3_embeddings.pt'))
+        test_embed  = torch.load(os.path.join(path, 'test_esm3_embeddings.pt'))
+
+        self.train_loader = DataLoader(DPOTripletDataset(train_df, train_embed), batch_size=self.batch_size, shuffle=True)
+        self.val_loader   = DataLoader(DPOTripletDataset(val_df, val_embed), batch_size=self.batch_size, shuffle=False)
+        self.test_loader  = DataLoader(DPOTripletDataset(test_df, test_embed), batch_size=self.batch_size, shuffle=False)
+
+    def dpo_loss(self, embeds, positions, pos_mut, neg_mut):
+        B = embeds.size(0)
+        idx = torch.arange(B, device=self.device)
+
+        logits_ref   = self.head_ref(embeds)
+        logits_train = self.head_train(embeds)
+        logp_ref     = F.log_softmax(logits_ref, dim=-1)
+        logp_train   = F.log_softmax(logits_train, dim=-1)
+
+        AA_list = list("ACDEFGHIKLMNPQRSTVWY")
+        aa_to_idx = {aa: i for i, aa in enumerate(AA_list)}
+        pos_ids = torch.tensor([aa_to_idx[m] for m in pos_mut], device=self.device)
+        neg_ids = torch.tensor([aa_to_idx[m] for m in neg_mut], device=self.device)
+        
+        pos_ref   = logp_ref[idx, pos_ids]
+        neg_ref   = logp_ref[idx, neg_ids]
+        pos_train = logp_train[idx, pos_ids]
+        neg_train = logp_train[idx, neg_ids]
+        return self.dpo(pos_train, neg_train, pos_ref, neg_ref)
+    
+    def train_and_val(self):
+        best_val = float('inf')
+        for epoch in range(self.num_epochs):
+            self.head_train.train()
+            total_loss = 0.0
+            for embeds, _, pos_mut, neg_mut in self.train_loader:
+                embeds = embeds.to(self.device)
+                loss = self.dpo_loss(embeds, None, pos_mut, neg_mut)
+
+                self.optimizer.zero_grad()
+                loss.backward()
+                self.optimizer.step()
+                total_loss += loss.item()
+            avg_loss = total_loss / len(self.train_loader)
+            val_loss = self.eval()
+            print(f'Epoch {epoch+1}: train={avg_loss:.4f}, val={val_loss:.4f}')
+
+            self.scheduler.step(val_loss)
+            if val_loss < best_val:
+                best_val = val_loss
+                patience_counter = 0
+                torch.save(self.head_train.state_dict(), 'best_head.pt')
+
+    def eval(self, test=False):
+        self.head_train.eval()
+        total_loss = 0.0
+        loader = self.test_loader if test else self.val_loader
+        with torch.no_grad():
+            for embeds, _, pos_mut, neg_mut in loader:
+                embeds = embeds.to(self.device)
+                total_loss += self.dpo_loss(embeds, None, pos_mut, neg_mut).item()
+        return total_loss / len(loader)
+
+if __name__ == "__main__":
+    exp = Experiment()
+    exp.load_data('/om/user/oliviat/18.S997_project')
+    print("Starting training...")
+    exp.train_and_val()
+    print("Loading best model and testing...")
+    exp.head_train.load_state_dict(torch.load('best_head.pt'))
+    print(f"Test loss: {exp.eval(test=True):.4f}")
+    print("Done!")
