@@ -1,4 +1,4 @@
-This is the repository for the Spring 2025 6.8711 final project codes:
+This is the repository for the Spring 2025 6.8711 final project codes written by Alina Guo and Olivia Tang.
 
 The repository includes the following scripts:
 
